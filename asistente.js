@@ -26,7 +26,6 @@
     autoAnalyze: true,
     captureReqBody: true,
     rulesText: "Regla 0 (la más prioritaria): el precio de una cuenta o subcuenta no puede quedar negativo respecto a lo que ya se haya pagado. Regla 1: Item padre o hijo pagado al 100%: no se puede modificar precio ni borrar. Regla 2: Item padre o hijo de un item con algún otro hijo ya pagado: no se puede modificar precio de item padre, no se puede borrar. Sí se puede modificar precio de hijos (solo afectando al propio hijo). Regla 3: Item o parte de item (considerando el total del item) sin ningún pago: puedo modificarlo, cambiarle precio, o borrarlo. Regla 4: Item spliteado: cuando se le cambia algo al padre, se aplica el cambio a los hijos. Y cuando se hacen cambios en un hijo se reflejan también en resto de hijos y padre (sin entrar en loops…), excepto los cambios de precio (descuento, open item), que solo se aplican a esa misma parte. Regla 5: editar header y header subcuenta: siempre se permite, pero tienen preferencia las reglas anteriores, asi que en algunos items podrian aplicarse el descuento global y en otros no (como ya se hace un poco con bebidas alcoholicas).  ",
-  ,
   }, loadCfg());
 
   // ---------- Estado ----------
