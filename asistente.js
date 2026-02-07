@@ -1,54 +1,54 @@
-<script src="https://js.puter.com/v2/"></script>
-
-
 (function(){
   // ===========================================================
-  // IA ASISTENTE - MVP
-  // Autor: Lucas + M365 Copilot
+  // IA ASISTENTE (solo Puter.js) - MVP
   // Descripción:
-  //  - Inyecta panel lateral con UI
-  //  - Intercepta window.fetch (requests/responses)
-  //  - Envía estado a un LLM (OpenAI o Azure OpenAI)
-  //  - Explica reglas, bloqueos y límites (ej. Regla 0)
+  //  - Inyecta panel lateral
+  //  - Intercepta window.fetch
+  //  - Llama a Puter.js (gpt-5-nano) sin API key
+  //  - Rate limit + cola + backoff ante 429 / errores
+  //  - Persiste configuración básica en localStorage
   // ===========================================================
 
-  // Evitar doble inyección
   if (window.__IA_ASISTENTE_ACTIVE__) {
     alert("IA Asistente ya está activo.");
     return;
   }
   window.__IA_ASISTENTE_ACTIVE__ = true;
 
-  // ---------- Utilidades de almacenamiento ----------
-  const LS_KEY = "iaAsistente.v1";
+  // ---------- Storage ----------
+  const LS_KEY = "iaAsistente.v2.puter";
   const loadCfg = () => {
     try { return JSON.parse(localStorage.getItem(LS_KEY) || "{}"); }
     catch { return {}; }
   };
   const saveCfg = (cfg) => localStorage.setItem(LS_KEY, JSON.stringify(cfg));
-
   const cfg = Object.assign({
-    provider: "openai",                // 'openai' | 'azure'
-    openaiModel: "gpt-4.1",
-    openaiEndpoint: "https://api.openai.com/v1/chat/completions",
-    azureEndpoint: "",                 // p.ej.: https://TU-RESOURCE.openai.azure.com
-    azureDeployment: "",               // nombre del deployment, p.ej. 'gpt-4o'
-    azureApiVersion: "2024-06-01",
-    apiKey: "",
     autoAnalyze: true,
     captureReqBody: true,
     rulesText: "Regla 0 (la más prioritaria): el precio de una cuenta o subcuenta no puede quedar negativo respecto a lo que ya se haya pagado. Regla 1: Item padre o hijo pagado al 100%: no se puede modificar precio ni borrar. Regla 2: Item padre o hijo de un item con algún otro hijo ya pagado: no se puede modificar precio de item padre, no se puede borrar. Sí se puede modificar precio de hijos (solo afectando al propio hijo). Regla 3: Item o parte de item (considerando el total del item) sin ningún pago: puedo modificarlo, cambiarle precio, o borrarlo. Regla 4: Item spliteado: cuando se le cambia algo al padre, se aplica el cambio a los hijos. Y cuando se hacen cambios en un hijo se reflejan también en resto de hijos y padre (sin entrar en loops…), excepto los cambios de precio (descuento, open item), que solo se aplican a esa misma parte. Regla 5: editar header y header subcuenta: siempre se permite, pero tienen preferencia las reglas anteriores, asi que en algunos items podrian aplicarse el descuento global y en otros no (como ya se hace un poco con bebidas alcoholicas).  ",
+  ,
   }, loadCfg());
 
-  // ---------- Estado en memoria ----------
+  // ---------- Estado ----------
   let originalFetch = window.fetch;
   let patched = false;
   let lastRequestJSON = null;
   let lastResponseJSON = null;
-  let lastEventTime = 0;
+
+  // ---- Rate limit & queue ----
+  const LLM_MIN_INTERVAL_MS = 8000; // 8s entre llamadas
+  let llmBusy = false;
+  let llmLastCallTs = 0;
+  let llmQueue = []; // [{state, resolve, reject}]
+  let lastStateHash = null;
+
+  // Backoff 429 / errores transitorios
+  const BASE_BACKOFF_MS = 4000;  // 4s
+  const MAX_BACKOFF_MS = 60000;  // 60s
+  let currentBackoffMs = 0;
 
   // ===========================================================
-  // UI - PANEL LATERAL
+  // UI Panel
   // ===========================================================
   const $ = (sel) => panel.querySelector(sel);
 
@@ -64,7 +64,7 @@
     <div style="display:flex; align-items:center; justify-content:space-between; padding:12px 14px; background:#1a237e;">
       <div style="display:flex; align-items:center; gap:8px;">
         <span style="font-size:20px;">🧠</span>
-        <h3 style="margin:0; font-size:16px;">IA Asistente</h3>
+        <h3 style="margin:0; font-size:16px;">IA Asistente (Puter.js)</h3>
       </div>
       <div style="display:flex; gap:8px; align-items:center;">
         <button id="btn-min" title="Minimizar" style="background:#303f9f;color:#fff;border:0;border-radius:6px;padding:6px 8px;cursor:pointer;">—</button>
@@ -73,37 +73,12 @@
     </div>
 
     <div style="padding:10px 14px; overflow:auto; flex:1;">
-      <section style="margin-bottom:10px;">
-        <label style="display:block; font-size:12px; opacity:.8;">Proveedor</label>
-        <select id="provider" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;">
-          <option value="openai">OpenAI</option>
-          <option value="azure">Azure OpenAI</option>
-        </select>
+      <section style="margin-bottom:10px; font-size:12px; opacity:.85;">
+        <strong>Motor:</strong> Puter.js (gratuito, sin API key). Ideal para MVP. <a href="https://developer.puter.com" target="_blank" style="color:#90caf9;">Docs</a>
       </section>
 
-      <section id="openai-box" style="display:none; gap:8px;">
-        <label style="display:block; font-size:12px; opacity:.8;">Modelo (OpenAI)</label>
-        <input id="openai-model" placeholder="gpt-4.1" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-        <label style="display:block; font-size:12px; opacity:.8; margin-top:6px;">Endpoint</label>
-        <input id="openai-endpoint" placeholder="https://api.openai.com/v1/chat/completions" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-      </section>
-
-      <section id="azure-box" style="display:none; gap:8px;">
-        <label style="display:block; font-size:12px; opacity:.8;">Endpoint Azure</label>
-        <input id="azure-endpoint" placeholder="https://TU-RESOURCE.openai.azure.com" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-        <label style="display:block; font-size:12px; opacity:.8; margin-top:6px;">Deployment</label>
-        <input id="azure-deployment" placeholder="nombre-del-deployment" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-        <label style="display:block; font-size:12px; opacity:.8; margin-top:6px;">API Version</label>
-        <input id="azure-version" placeholder="2024-06-01" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-      </section>
-
-      <section style="margin-top:10px;">
-        <label style="display:block; font-size:12px; opacity:.8;">API Key (se guarda localmente)</label>
-        <input id="api-key" placeholder="sk-..." type="password" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#121536; color:#fff;" />
-      </section>
-
-      <section style="margin-top:10px;">
-        <label style="display:block; font-size:12px; opacity:.8;">Reglas (pega aquí tu documento)</label>
+      <section style="margin-top:8px;">
+        <label style="display:block; font-size:12px; opacity:.8;">Reglas (pega tu documento)</label>
         <textarea id="rules" rows="8" style="width:100%; padding:8px; border-radius:6px; border:1px solid #3949ab; background:#0c0f2a; color:#e8eaf6; font-family:monospace;"></textarea>
       </section>
 
@@ -144,40 +119,15 @@
   `;
   document.body.appendChild(panel);
 
-  // ---------- UI: eventos ----------
+  // ---------- UI logic ----------
   const syncUI = () => {
-    $("#provider").value = cfg.provider;
-    $("#openai-model").value = cfg.openaiModel;
-    $("#openai-endpoint").value = cfg.openaiEndpoint;
-    $("#azure-endpoint").value = cfg.azureEndpoint;
-    $("#azure-deployment").value = cfg.azureDeployment;
-    $("#azure-version").value = cfg.azureApiVersion;
-    $("#api-key").value = cfg.apiKey;
     $("#rules").value = cfg.rulesText;
     $("#auto-analyze").checked = !!cfg.autoAnalyze;
     $("#cap-req").checked = !!cfg.captureReqBody;
-    toggleProviderBox();
   };
-
-  const toggleProviderBox = () => {
-    $("#openai-box").style.display = cfg.provider === "openai" ? "block" : "none";
-    $("#azure-box").style.display = cfg.provider === "azure" ? "block" : "none";
-  };
-
-  $("#provider").addEventListener("change", () => {
-    cfg.provider = $("#provider").value;
-    toggleProviderBox();
-    saveCfg(cfg);
-  });
+  const statusMsg = (msg) => $("#status").textContent = msg;
 
   $("#btn-save").addEventListener("click", () => {
-    cfg.provider = $("#provider").value;
-    cfg.openaiModel = $("#openai-model").value.trim();
-    cfg.openaiEndpoint = $("#openai-endpoint").value.trim();
-    cfg.azureEndpoint = $("#azure-endpoint").value.trim();
-    cfg.azureDeployment = $("#azure-deployment").value.trim();
-    cfg.azureApiVersion = $("#azure-version").value.trim();
-    cfg.apiKey = $("#api-key").value.trim();
     cfg.rulesText = $("#rules").value;
     cfg.autoAnalyze = $("#auto-analyze").checked;
     cfg.captureReqBody = $("#cap-req").checked;
@@ -191,7 +141,7 @@
       statusMsg("⚠️ No hay estado capturado aún.");
       return;
     }
-    analyze(state);
+    enqueueAnalysis(state);
   });
 
   $("#btn-clear").addEventListener("click", () => {
@@ -232,8 +182,6 @@
     saveCfg(cfg);
   });
 
-  const statusMsg = (msg) => $("#status").textContent = msg;
-
   syncUI();
 
   // ===========================================================
@@ -246,7 +194,7 @@
 
     window.fetch = async function(...args){
       try {
-        // 1) Captura del REQUEST
+        // 1) Captura REQUEST
         try {
           const req = parseRequest(args);
           if (req && cfg.captureReqBody) {
@@ -261,7 +209,7 @@
         // 2) Llamada real
         const resp = await originalFetch.apply(this, args);
 
-        // 3) Captura del RESPONSE (si es JSON)
+        // 3) Captura RESPONSE JSON
         try {
           const clone = resp.clone();
           const contentType = (clone.headers && clone.headers.get("content-type")) || "";
@@ -291,7 +239,6 @@
   }
 
   function parseRequest(args){
-    // args[0] puede ser string o Request, args[1] init
     let url = "", method = "GET", headers = {}, body = null;
     try {
       if (typeof args[0] === "string") url = args[0];
@@ -302,7 +249,7 @@
       headers = init.headers || {};
       body = init.body || null;
       if (body && typeof body !== "string") {
-        // Si es FormData/URLSearchParams/Blob, no lo tocamos
+        // FormData/URLSearchParams/Blob -> no tocamos
         body = null;
       }
       return { url, method, headers, body };
@@ -312,41 +259,119 @@
   }
 
   function showPreview(kind, obj){
-    const maxLen = 8000; // evita volcar objetos gigantes
+    const maxLen = 8000;
     const text = JSON.stringify(obj, null, 2);
     const trimmed = text.length > maxLen ? (text.slice(0, maxLen) + "\n…(truncado)…") : text;
     $("#preview").textContent = `[${kind}] ${new Date().toLocaleTimeString()} \n` + trimmed;
   }
 
-  function maybeAnalyze(state){
-    const now = Date.now();
-    // Rate limit: 1 análisis / 2.5s
-    if (now - lastEventTime > 2500) {
-      lastEventTime = now;
-      analyze(state);
-    }
-  }
-
   patchFetch();
 
   // ===========================================================
-  // LLM: construcción del prompt y llamada
+  // Cola / rate limit / análisis
   // ===========================================================
-  async function analyze(state){
-    const rules = (cfg.rulesText || "").trim();
-    const key = (cfg.apiKey || "").trim();
-    if (!key) {
-      statusMsg("🔑 Falta API Key. Pégala y guarda.");
+  function hashString(s){
+    let h = 0, i, chr;
+    if (s.length === 0) return h;
+    for (i=0; i<s.length; i++){
+      chr = s.charCodeAt(i);
+      h = ((h<<5)-h) + chr;
+      h |= 0;
+    }
+    return String(h);
+  }
+
+  function maybeAnalyze(state){
+    const now = Date.now();
+    // Pequeño rate limit para auto‑análisis en tiempo real
+    if (now - llmLastCallTs > 2500) {
+      enqueueAnalysis(state);
+    }
+  }
+
+  function enqueueAnalysis(state) {
+    const serialized = safeStringify(state, 0);
+    const h = hashString(serialized);
+    if (lastStateHash === h) {
+      statusMsg("🟡 Estado ya analizado: evitando llamada redundante.");
       return;
     }
+    lastStateHash = h;
+
+    return new Promise((resolve, reject) => {
+      llmQueue.push({ state, resolve, reject });
+      drainQueue();
+    });
+  }
+
+  async function drainQueue(){
+    if (llmBusy) return;
+    if (llmQueue.length === 0) return;
+
+    const now = Date.now();
+    const since = now - llmLastCallTs;
+    const waitNeeded = Math.max(0, (currentBackoffMs || 0), LLM_MIN_INTERVAL_MS - since);
+
+    llmBusy = true;
+    if (waitNeeded > 0) {
+      statusMsg(`⏳ Esperando ${Math.ceil(waitNeeded/1000)}s por rate limit...`);
+      await new Promise(r => setTimeout(r, waitNeeded));
+    }
+
+    const job = llmQueue.shift();
+    try {
+      const text = await analyze(job.state);
+      job.resolve(text);
+      currentBackoffMs = 0; // éxito: resetea backoff
+    } catch (e) {
+      job.reject(e);
+    } finally {
+      llmLastCallTs = Date.now();
+      llmBusy = false;
+      drainQueue();
+    }
+  }
+
+  // ===========================================================
+  // LLM via Puter.js
+  // ===========================================================
+  (function loadPuter(){
+    const scriptId = "puter-sdk";
+    if (document.getElementById(scriptId)) return;
+    const s = document.createElement("script");
+    s.id = scriptId;
+    s.src = "https://js.puter.com/v2/";
+    s.async = true;
+    document.head.appendChild(s);
+  })();
+
+  async function callPuterLLM({ prompt }){
+    if (!window.puter || !window.puter.ai) {
+      throw new Error("Puter SDK no cargado todavía. Espera 1–2s y reintenta.");
+    }
+    // Modelo económico para MVP
+    const resp = await window.puter.ai.chat(prompt, { model: "gpt-5-nano" });
+    return typeof resp === "string" ? resp : (resp?.toString?.() ?? JSON.stringify(resp));
+  }
+
+  // ===========================================================
+  // Análisis principal
+  // ===========================================================
+  function safeStringify(obj, indent=2){
+    try { return JSON.stringify(obj, null, indent); }
+    catch { return String(obj); }
+  }
+
+  async function analyze(state){
+    const rules = (cfg.rulesText || "").trim();
     if (!rules) {
       statusMsg("📄 Falta texto de reglas. Pégalas y guarda.");
-      return;
+      throw new Error("Missing rules");
     }
 
     statusMsg("🤖 Analizando con IA…");
 
-    const baseInstruction = `
+     const baseInstruction = `
 Eres un asistente experto en las reglas de split y cobro que te he pasado, para una app de gestion de las comandas en un restaurant, para que usen los camareros.
 Tu tarea es explicar, con base en las reglas, el estado recibido y responder:
 1) Qué acciones están bloqueadas por alguna regla.
@@ -367,102 +392,35 @@ Cumplimiento regla 3: sin limitaciones a la hora de borrar deslizando, en borrar
 Cumplimiento regla 4: lógica de que al editar/borrar el padre también se intenten modificar las hijas, y lógica de que al editar sin modificar precio y al borrar un item hijo, se intente aplicar al padre y (en consecuencia?) al resto de los hijos. Si alguno de los cambios no se puede realizar porque incumpliría alguna regla anterior (en principio seria por la regla 0), no se hace ningún cambio y salta toast (que ya estaría implementado de la regla 0)
 Cumplimiento regla 5: los únicos cambios criticos posibles de los headers es que se asigne un descuento o quitar service charge (ver anexo). El header de la orden completa afecta, se aplica, en los ítems padres, no en los hijos. Al cambiar algo en los header, se intenta uno por uno aplicar los cambios requeridos (añadir descuentos a todos los ítems afectados). En los ítems en los que no se incumpla ninguna regla anterior se efectúan los cambios. Si en algún item no se puede aplicar el cambio porque incumpliría alguna regla, no se efectúa el cambio. Cuando se haya acabado de aplicar los cambios a todos los ítems afectados, si en alguno no se ha podido aplicar, salta toast avisándolo. 
 
-ESTADO ACTUAL (JSON real o aproximado capturado del front/back):
+
+ESTADO (JSON capturado):
 ${safeStringify(state, 2)}
-`.trim();
+    `.trim();
 
     try {
-      let text = "";
-      if (cfg.provider === "openai") {
-        text = await callOpenAI({
-          endpoint: cfg.openaiEndpoint,
-          model: cfg.openaiModel,
-          apiKey: key,
-          system: "Eres un experto en cobros, splits y descuentos.",
-          user: baseInstruction
-        });
-      } else if {
-        text = await callAzureOpenAI({
-          endpoint: cfg.azureEndpoint,
-          deployment: cfg.azureDeployment,
-          apiVersion: cfg.azureApiVersion,
-          apiKey: key,
-          system: "Eres un experto en cobros, splits y descuentos.",
-          user: baseInstruction
-        });
-      } else {
-        puter.ai.chat(baseInstruction, { model: "gpt-5-nano" })
-      }
-
+      const text = await callPuterLLM({ prompt: baseInstruction });
       $("#out-body").textContent = text || "Sin respuesta.";
       statusMsg("✅ Análisis completado.");
+      return text;
+
     } catch (e) {
+      // Detección básica de 429 (por si el backend devolviera algo similar)
+      const is429 = /429|Too Many Requests/i.test(String(e));
+      if (is429) {
+        currentBackoffMs = Math.min(MAX_BACKOFF_MS, currentBackoffMs ? currentBackoffMs * 2 : BASE_BACKOFF_MS);
+        statusMsg(`⛔ 429 recibido. Backoff: ${Math.ceil(currentBackoffMs/1000)}s`);
+      } else {
+        statusMsg("❌ Error en la IA. Revisa consola.");
+      }
       $("#out-body").textContent = "❌ Error: " + (e?.message || e);
-      statusMsg("❌ Error en la llamada a la IA (CSP/CORS/clave). Revisa consola.");
       console.error("[IA Asistente] Error LLM:", e);
+      throw e;
     }
-  }
-
-  function safeStringify(obj, indent=2){
-    try { return JSON.stringify(obj, null, indent); }
-    catch { return String(obj); }
-  }
-
-  async function callOpenAI({ endpoint, model, apiKey, system, user }){
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: {
-        "Authorization": "Bearer " + apiKey,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        model,
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ],
-        temperature: 0.2
-      })
-    });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`OpenAI error ${res.status}: ${txt}`);
-    }
-    const json = await res.json();
-    return json?.choices?.[0]?.message?.content || "";
-  }
-
-  async function callAzureOpenAI({ endpoint, deployment, apiVersion, apiKey, system, user }){
-    if (!endpoint || !deployment) {
-      throw new Error("Configura endpoint y deployment de Azure OpenAI.");
-    }
-    const url = `${endpoint}/openai/deployments/${deployment}/chat/completions?api-version=${encodeURIComponent(apiVersion)}`;
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "api-key": apiKey,
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify({
-        messages: [
-          { role: "system", content: system },
-          { role: "user", content: user }
-        ],
-        temperature: 0.2
-      })
-    });
-    if (!res.ok) {
-      const txt = await res.text();
-      throw new Error(`Azure OpenAI error ${res.status}: ${txt}`);
-    }
-    const json = await res.json();
-    return json?.choices?.[0]?.message?.content || "";
   }
 
   // ===========================================================
   // Créditos y advertencias
   // ===========================================================
-  console.log("%cIA Asistente","background:#1a237e;color:#fff;padding:4px 8px;border-radius:4px", "MVP cargado. Usa el panel para configurar tu API Key y reglas.");
-  console.log("Nota: si la página aplica CSP estricta, podría bloquear la carga del script externo o las llamadas a la IA. En tal caso, usa Tampermonkey/Extensión.");
-
+  console.log("%cIA Asistente (Puter.js)","background:#1a237e;color:#fff;padding:4px 8px;border-radius:4px", "MVP cargado. Pega tus reglas y activa el autoanálisis si lo deseas.");
+  console.log("Nota: si la página aplica CSP estricta, podría bloquear la carga del script externo o las llamadas. En tal caso, usa Tampermonkey/Extensión.");
 })();
