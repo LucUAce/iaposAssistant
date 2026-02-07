@@ -1,3 +1,6 @@
+<script src="https://js.puter.com/v2/"></script>
+
+
 (function(){
   // ===========================================================
   // IA ASISTENTE - MVP
@@ -378,7 +381,7 @@ ${safeStringify(state, 2)}
           system: "Eres un experto en cobros, splits y descuentos.",
           user: baseInstruction
         });
-      } else {
+      } else if {
         text = await callAzureOpenAI({
           endpoint: cfg.azureEndpoint,
           deployment: cfg.azureDeployment,
@@ -387,6 +390,8 @@ ${safeStringify(state, 2)}
           system: "Eres un experto en cobros, splits y descuentos.",
           user: baseInstruction
         });
+      } else {
+        puter.ai.chat(baseInstruction, { model: "gpt-5-nano" })
       }
 
       $("#out-body").textContent = text || "Sin respuesta.";
